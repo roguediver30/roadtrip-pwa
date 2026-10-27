@@ -10,7 +10,7 @@
   <style>
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1a1a1a; color: #eee; }
-    #map { height: calc(100% - 56px); width: 100%; }
+    #map { height: calc(100% - 120px); width: 100%; }
     #controls {
       height: 56px;
       background: #2c3e50;
@@ -21,6 +21,26 @@
       gap: 6px;
       overflow-x: auto;
     }
+    #address-bar {
+      height: 64px;
+      background: #1e2a38;
+      display: flex;
+      flex-direction: column;
+      padding: 6px 8px;
+      gap: 4px;
+    }
+    #address-bar input {
+      flex: 1;
+      padding: 6px 10px;
+      border: none;
+      border-radius: 4px;
+      font-size: 14px;
+      background: #34495e;
+      color: white;
+    }
+    #address-bar input::placeholder { color: #aaa; }
+    #address-row { display: flex; gap: 6px; }
+    #btnGo { background: #27ae60; font-weight: bold; }
     button {
       background: #34495e;
       color: white;
@@ -35,14 +55,41 @@
     button:active { transform: scale(0.96); }
     .leaflet-popup-content { font-size: 14px; }
     #status { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.7); color: white; padding: 6px 10px; border-radius: 4px; z-index: 1000; font-size: 12px; }
+    #hud {
+      position: absolute;
+      bottom: 66px;
+      left: 10px;
+      background: rgba(0,0,0,0.75);
+      color: white;
+      padding: 8px 12px;
+      border-radius: 6px;
+      z-index: 1000;
+      font-size: 13px;
+      line-height: 1.4;
+      min-width: 140px;
+      pointer-events: none;
+    }
+    #hud div { margin: 2px 0; }
   </style>
 </head>
 <body>
-  <div id="status">Loading route...</div>
+  <div id="status">Enter addresses and tap Go</div>
+  <div id="hud">
+    <div id="hudMiles">Miles left: —</div>
+    <div id="hudTime">ETA: —</div>
+  </div>
+  <div id="address-bar">
+    <div id="address-row">
+      <input id="fromInput" type="text" placeholder="From address" value="Hendersonville, NC">
+      <input id="toInput" type="text" placeholder="To address" value="Observer Ranch, Penrose, CO">
+    </div>
+    <button id="btnGo" style="width:100%; margin-top:2px;">Go</button>
+  </div>
   <div id="map"></div>
   <div id="controls">
     <button id="btnLocate">📍 My Location</button>
-    <button id="btnRoute">🛣️ Route</button>
+    <button id="btnFit">🗺️ Fit Route</button>
+    <button id="btnRoute">🛣️ Reload Route</button>
     <button id="btnGas">⛽ Gas Stops</button>
     <button id="btnSpeed">📷 Speed Cams</button>
     <button id="btnFlock">🔒 Flock/ALPR</button>
@@ -75,6 +122,9 @@
     let flockLayer = L.layerGroup();
     let userMarker = null;
     let watchId = null;
+    let totalDistanceMiles = 0;
+    let totalDurationMin = 0;
+    let routeCoords = null; // for simple remaining estimate
 
     const statusEl = document.getElementById('status');
 
@@ -83,11 +133,31 @@
       setTimeout(() => { if (statusEl.textContent === msg) statusEl.textContent = ''; }, 4000);
     }
 
-    // Load route from public OSRM
+    // Geocode address using Nominatim (free OSM)
+    async function geocode(address) {
+      const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(address)}&limit=1`;
+      const res = await fetch(url, { headers: { 'User-Agent': 'RoadTripPWA/1.0' } });
+      const data = await res.json();
+      if (data && data[0]) {
+        return [parseFloat(data[0].lat), parseFloat(data[0].lon)];
+      }
+      throw new Error('Address not found: ' + address);
+    }
+
+    // Load route from public OSRM using dynamic start/end
     async function loadRoute() {
-      setStatus('Fetching route...');
-      const url = `https://router.project-osrm.org/route/v1/driving/${START[1]},${START[0]};${END[1]},${END[0]}?geometries=geojson&overview=full`;
+      const fromAddr = document.getElementById('fromInput').value.trim();
+      const toAddr = document.getElementById('toInput').value.trim();
+      if (!fromAddr || !toAddr) {
+        setStatus('Please enter both addresses');
+        return;
+      }
+      setStatus('Geocoding...');
       try {
+        const start = await geocode(fromAddr);
+        const end = await geocode(toAddr);
+        setStatus('Fetching route...');
+        const url = `https://router.project-osrm.org/route/v1/driving/${start[1]},${start[0]};${end[1]},${end[0]}?geometries=geojson&overview=full`;
         const res = await fetch(url);
         const data = await res.json();
         if (data.routes && data.routes[0]) {
@@ -96,10 +166,21 @@
             style: { color: '#3498db', weight: 5, opacity: 0.8 }
           }).addTo(map);
           map.fitBounds(routeLayer.getBounds(), { padding: [30, 30] });
-          setStatus('Route loaded (~' + Math.round(data.routes[0].distance / 1609) + ' miles)');
+          const miles = Math.round(data.routes[0].distance / 1609);
+          const minutes = Math.round(data.routes[0].duration / 60);
+          totalDistanceMiles = miles;
+          totalDurationMin = minutes;
+          routeCoords = data.routes[0].geometry.coordinates; // [lon, lat] pairs
+          updateHUD(miles, minutes);
+          setStatus(`Route loaded (~${miles} miles)`);
+          // Store for gas stops reference
+          window.currentStart = start;
+          window.currentEnd = end;
+        } else {
+          setStatus('No route found');
         }
       } catch (e) {
-        setStatus('Route load failed – check connection');
+        setStatus('Error: ' + e.message);
         console.error(e);
       }
     }
@@ -114,7 +195,37 @@
       { lat: 38.43, lon: -104.8, name: 'Shell – near Colorado Springs', brand: 'Shell' }
     ];
 
-    function showGasStops() {
+    function updateHUD(miles, minutes) {
+      const hudMiles = document.getElementById('hudMiles');
+      const hudTime = document.getElementById('hudTime');
+      if (miles != null) {
+        hudMiles.textContent = `Miles left: ${miles}`;
+      }
+      if (minutes != null) {
+        const hrs = Math.floor(minutes / 60);
+        const mins = minutes % 60;
+        hudTime.textContent = `ETA: ${hrs}h ${mins}m`;
+      }
+    }
+
+    function estimateRemaining(userLat, userLon) {
+      if (!routeCoords || !totalDistanceMiles) return;
+      // Simple approximation: find closest point on route and estimate fraction remaining
+      let minDist = Infinity;
+      let closestIdx = 0;
+      for (let i = 0; i < routeCoords.length; i++) {
+        const [lon, lat] = routeCoords[i];
+        const d = Math.hypot(lat - userLat, lon - userLon);
+        if (d < minDist) {
+          minDist = d;
+          closestIdx = i;
+        }
+      }
+      const fraction = closestIdx / routeCoords.length;
+      const remainingMiles = Math.max(0, Math.round(totalDistanceMiles * (1 - fraction)));
+      const remainingMin = Math.max(0, Math.round(totalDurationMin * (1 - fraction)));
+      updateHUD(remainingMiles, remainingMin);
+    }
       gasLayer.clearLayers();
       sampleGas.forEach(g => {
         L.marker([g.lat, g.lon]).bindPopup(`<b>${g.name}</b><br>Brand: ${g.brand}<br>Suggested ~300 mi interval stop`).addTo(gasLayer);
@@ -153,34 +264,69 @@
       }
     }
 
-    // GPS tracking
-    function startTracking() {
-      if (!navigator.geolocation) {
-        setStatus('Geolocation not available');
-        return;
+    // GPS tracking (toggleable so you can browse freely)
+    let trackingEnabled = false;
+
+    function toggleTracking() {
+      const btn = document.getElementById('btnLocate');
+      if (trackingEnabled) {
+        // Stop tracking
+        if (watchId) navigator.geolocation.clearWatch(watchId);
+        watchId = null;
+        trackingEnabled = false;
+        btn.classList.remove('active');
+        btn.textContent = '📍 My Location';
+        setStatus('Tracking off – free to browse');
+      } else {
+        // Start tracking
+        if (!navigator.geolocation) {
+          setStatus('Geolocation not available');
+          return;
+        }
+        trackingEnabled = true;
+        btn.classList.add('active');
+        btn.textContent = '📍 Tracking On';
+        watchId = navigator.geolocation.watchPosition(
+          pos => {
+            if (!trackingEnabled) return;
+            const { latitude, longitude } = pos.coords;
+            if (!userMarker) {
+              userMarker = L.circleMarker([latitude, longitude], {
+                radius: 8, fillColor: '#e74c3c', color: '#fff', weight: 2, fillOpacity: 1
+              }).addTo(map);
+            } else {
+              userMarker.setLatLng([latitude, longitude]);
+            }
+            estimateRemaining(latitude, longitude);
+            // Only pan if tracking is still enabled
+            map.panTo([latitude, longitude]);
+          },
+          err => {
+            setStatus('GPS error: ' + err.message);
+            trackingEnabled = false;
+            btn.classList.remove('active');
+            btn.textContent = '📍 My Location';
+          },
+          { enableHighAccuracy: true, maximumAge: 5000 }
+        );
+        setStatus('Live tracking on');
       }
-      if (watchId) navigator.geolocation.clearWatch(watchId);
-      watchId = navigator.geolocation.watchPosition(
-        pos => {
-          const { latitude, longitude } = pos.coords;
-          if (!userMarker) {
-            userMarker = L.circleMarker([latitude, longitude], {
-              radius: 8, fillColor: '#e74c3c', color: '#fff', weight: 2, fillOpacity: 1
-            }).addTo(map);
-          } else {
-            userMarker.setLatLng([latitude, longitude]);
-          }
-          map.panTo([latitude, longitude]);
-        },
-        err => setStatus('GPS error: ' + err.message),
-        { enableHighAccuracy: true, maximumAge: 5000 }
-      );
-      setStatus('Live tracking on');
+    }
+
+    function fitRoute() {
+      if (routeLayer) {
+        map.fitBounds(routeLayer.getBounds(), { padding: [30, 30] });
+        setStatus('Centered on route');
+      } else {
+        setStatus('No route loaded yet');
+      }
     }
 
     // Button handlers
-    document.getElementById('btnLocate').onclick = startTracking;
+    document.getElementById('btnLocate').onclick = toggleTracking;
+    document.getElementById('btnFit').onclick = fitRoute;
     document.getElementById('btnRoute').onclick = loadRoute;
+    document.getElementById('btnGo').onclick = loadRoute;
     document.getElementById('btnGas').onclick = () => {
       showGasStops();
       document.getElementById('btnGas').classList.add('active');
@@ -208,13 +354,11 @@
       }
     };
 
-    // Auto-load route on start
-    loadRoute();
-
     // Register service worker for PWA
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('./sw.js').catch(console.error);
     }
+    // Don't auto-load; wait for user to tap Go
   </script>
 </body>
 </html>
