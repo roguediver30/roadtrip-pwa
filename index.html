@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#2c3e50">
+  <title>Road Trip GPS</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1a1a1a; color: #eee; }
+    #map { height: calc(100% - 56px); width: 100%; }
+    #controls {
+      height: 56px;
+      background: #2c3e50;
+      display: flex;
+      align-items: center;
+      justify-content: space-around;
+      padding: 0 8px;
+      gap: 6px;
+      overflow-x: auto;
+    }
+    button {
+      background: #34495e;
+      color: white;
+      border: none;
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      white-space: nowrap;
+      cursor: pointer;
+    }
+    button.active { background: #27ae60; }
+    button:active { transform: scale(0.96); }
+    .leaflet-popup-content { font-size: 14px; }
+    #status { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.7); color: white; padding: 6px 10px; border-radius: 4px; z-index: 1000; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div id="status">Loading route...</div>
+  <div id="map"></div>
+  <div id="controls">
+    <button id="btnLocate">📍 My Location</button>
+    <button id="btnRoute">🛣️ Route</button>
+    <button id="btnGas">⛽ Gas Stops</button>
+    <button id="btnSpeed">📷 Speed Cams</button>
+    <button id="btnFlock">🔒 Flock/ALPR</button>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    // Hendersonville NC and Observer Ranch Penrose CO approximate coords
+    const START = [35.3187, -82.4609]; // Hendersonville, NC
+    const END = [38.4360, -105.0220];   // Observer Ranch area, Penrose, CO
+
+    const map = L.map('map', { zoomControl: false }).setView([36.5, -93], 5);
+
+    // Hybrid: Esri World Imagery (satellite) + OSM roads/labels overlay
+    const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      attribution: 'Tiles © Esri',
+      maxZoom: 19
+    }).addTo(map);
+
+    const roads = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap',
+      maxZoom: 19,
+      opacity: 0.55
+    }).addTo(map);
+
+    // Layers
+    let routeLayer = null;
+    let gasLayer = L.layerGroup().addTo(map);
+    let speedLayer = L.layerGroup();
+    let flockLayer = L.layerGroup();
+    let userMarker = null;
+    let watchId = null;
+
+    const statusEl = document.getElementById('status');
+
+    function setStatus(msg) {
+      statusEl.textContent = msg;
+      setTimeout(() => { if (statusEl.textContent === msg) statusEl.textContent = ''; }, 4000);
+    }
+
+    // Load route from public OSRM
+    async function loadRoute() {
+      setStatus('Fetching route...');
+      const url = `https://router.project-osrm.org/route/v1/driving/${START[1]},${START[0]};${END[1]},${END[0]}?geometries=geojson&overview=full`;
+      try {
+        const res = await fetch(url);
+        const data = await res.json();
+        if (data.routes && data.routes[0]) {
+          if (routeLayer) map.removeLayer(routeLayer);
+          routeLayer = L.geoJSON(data.routes[0].geometry, {
+            style: { color: '#3498db', weight: 5, opacity: 0.8 }
+          }).addTo(map);
+          map.fitBounds(routeLayer.getBounds(), { padding: [30, 30] });
+          setStatus('Route loaded (~' + Math.round(data.routes[0].distance / 1609) + ' miles)');
+        }
+      } catch (e) {
+        setStatus('Route load failed – check connection');
+        console.error(e);
+      }
+    }
+
+    // Sample gas stops (major brands near typical route – real app would query Overpass dynamically)
+    const sampleGas = [
+      { lat: 36.05, lon: -86.78, name: 'Pilot – Nashville area', brand: 'Pilot' },
+      { lat: 38.25, lon: -85.76, name: 'Love’s – Louisville area', brand: 'Love’s' },
+      { lat: 39.10, lon: -94.58, name: 'QuikTrip – Kansas City', brand: 'QuikTrip' },
+      { lat: 39.05, lon: -95.68, name: 'Pilot – Topeka area', brand: 'Pilot' },
+      { lat: 38.84, lon: -97.60, name: 'Love’s – Salina area', brand: 'Love’s' },
+      { lat: 38.43, lon: -104.8, name: 'Shell – near Colorado Springs', brand: 'Shell' }
+    ];
+
+    function showGasStops() {
+      gasLayer.clearLayers();
+      sampleGas.forEach(g => {
+        L.marker([g.lat, g.lon]).bindPopup(`<b>${g.name}</b><br>Brand: ${g.brand}<br>Suggested ~300 mi interval stop`).addTo(gasLayer);
+      });
+      setStatus('Gas stops shown (sample major brands)');
+    }
+
+    // Overpass helper for cameras in current view
+    async function loadCameras(type) {
+      const bounds = map.getBounds();
+      const bbox = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
+      let query = '';
+      if (type === 'speed') {
+        query = `[out:json][timeout:25];node["highway"="speed_camera"](${bbox});out;`;
+      } else {
+        query = `[out:json][timeout:25];node["man_made"="surveillance"](${bbox});out;`;
+      }
+      const url = 'https://overpass-api.de/api/interpreter?data=' + encodeURIComponent(query);
+      setStatus('Loading cameras...');
+      try {
+        const res = await fetch(url);
+        const data = await res.json();
+        const layer = type === 'speed' ? speedLayer : flockLayer;
+        layer.clearLayers();
+        (data.elements || []).forEach(el => {
+          if (el.lat && el.lon) {
+            const icon = type === 'speed' ? '📷' : '🔒';
+            L.marker([el.lat, el.lon], {
+              icon: L.divIcon({ className: 'cam-icon', html: icon, iconSize: [24, 24] })
+            }).bindPopup(type === 'speed' ? 'Speed camera (OSM)' : 'Surveillance / ALPR (OSM)').addTo(layer);
+          }
+        });
+        setStatus(`${(data.elements || []).length} ${type} cameras in view`);
+      } catch (e) {
+        setStatus('Camera load failed');
+      }
+    }
+
+    // GPS tracking
+    function startTracking() {
+      if (!navigator.geolocation) {
+        setStatus('Geolocation not available');
+        return;
+      }
+      if (watchId) navigator.geolocation.clearWatch(watchId);
+      watchId = navigator.geolocation.watchPosition(
+        pos => {
+          const { latitude, longitude } = pos.coords;
+          if (!userMarker) {
+            userMarker = L.circleMarker([latitude, longitude], {
+              radius: 8, fillColor: '#e74c3c', color: '#fff', weight: 2, fillOpacity: 1
+            }).addTo(map);
+          } else {
+            userMarker.setLatLng([latitude, longitude]);
+          }
+          map.panTo([latitude, longitude]);
+        },
+        err => setStatus('GPS error: ' + err.message),
+        { enableHighAccuracy: true, maximumAge: 5000 }
+      );
+      setStatus('Live tracking on');
+    }
+
+    // Button handlers
+    document.getElementById('btnLocate').onclick = startTracking;
+    document.getElementById('btnRoute').onclick = loadRoute;
+    document.getElementById('btnGas').onclick = () => {
+      showGasStops();
+      document.getElementById('btnGas').classList.add('active');
+    };
+    document.getElementById('btnSpeed').onclick = () => {
+      const btn = document.getElementById('btnSpeed');
+      if (map.hasLayer(speedLayer)) {
+        map.removeLayer(speedLayer);
+        btn.classList.remove('active');
+      } else {
+        loadCameras('speed');
+        speedLayer.addTo(map);
+        btn.classList.add('active');
+      }
+    };
+    document.getElementById('btnFlock').onclick = () => {
+      const btn = document.getElementById('btnFlock');
+      if (map.hasLayer(flockLayer)) {
+        map.removeLayer(flockLayer);
+        btn.classList.remove('active');
+      } else {
+        loadCameras('flock');
+        flockLayer.addTo(map);
+        btn.classList.add('active');
+      }
+    };
+
+    // Auto-load route on start
+    loadRoute();
+
+    // Register service worker for PWA
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./sw.js').catch(console.error);
+    }
+  </script>
+</body>
+</html>
